@@ -9,9 +9,6 @@
 
 set -e
 
-# Clean up
-rm -rf /var/lib/apt/lists/*
-
 VERSION=${VERSION:-"latest"}
 VERBOSE=${VERBOSE:-"true"}
 
@@ -46,28 +43,80 @@ YLZATHZKTJyiqA==
 =vYOk
 -----END PGP PUBLIC KEY BLOCK-----"
 
+# Ensure script is run as root
 if [ "$(id -u)" -ne 0 ]; then
-    echo -e 'Script must be run as root. Use sudo, su, or add "USER root" to your Dockerfile before running this script.'
+    echo 'Script must be run as root. Use sudo, su, or add "USER root" to your Dockerfile.' >&2
     exit 1
 fi
 
-apt_get_update()
-{
-    if [ "$(find /var/lib/apt/lists/* | wc -l)" = "0" ]; then
-        echo "Running apt-get update..."
-        apt-get update -y
+# --- ALPINE (apk) ---
+apk_install_packages() {
+    echo "Installing packages on Alpine: $*"
+    # --no-cache updates the index automatically and doesn't leave clutter
+    apk add --no-cache "$@"
+}
+
+# --- REDHAT/FEDORA (dnf) ---
+dnf_install_packages() {
+    # Check if any of the requested packages are missing
+    # dnf list installed <pkg> returns 0 if installed, 1 if not
+    if ! dnf list installed "$@" > /dev/null 2>&1; then
+        # Check if cache is empty before updating
+        if [ "$(find /var/cache/dnf/ -type f | wc -l)" = "0" ]; then
+            echo "Running dnf update..."
+            dnf update -y
+        fi
+        echo "Installing packages via dnf: $*"
+        dnf -y install --allowerasing "$@"
+        
+        # CLEANUP FOR DNF
+        echo "Cleaning up dnf cache..."
+        dnf clean all
+        rm -rf /var/cache/dnf
     fi
 }
 
-# Checks if packages are installed and installs them if not
+# --- DEBIAN/UBUNTU (apt) ---
+apt_install_packages() {
+    # Check if packages are missing using dpkg-query
+    # We loop through because dpkg -s needs a specific syntax for multiple packages
+    local missing_pkgs=""
+    for pkg in "$@"; do
+        if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+            missing_pkgs="$missing_pkgs $pkg"
+        fi
+    done
+
+    if [ -n "$missing_pkgs" ]; then
+        # Check if apt cache is empty (safer find syntax without wildcard)
+        if [ "$(find /var/lib/apt/lists/ -type f | wc -l)" = "0" ]; then
+            echo "Running apt-get update..."
+            apt-get update -y
+        fi
+        echo "Installing packages via apt: $missing_pkgs"
+        apt-get -y install --no-install-recommends $missing_pkgs
+
+        # CLEANUP FOR APT
+        echo "Cleaning up apt cache..."
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+    fi
+}
+
+# --- MAIN ENTRYPOINT ---
 check_packages() {
-    if ! dpkg -s "$@" > /dev/null 2>&1; then
-        apt_get_update
-        apt-get -y install --no-install-recommends "$@"
+    if [ -x "$(command -v apk)" ]; then
+        apk_install_packages "$@"
+    elif [ -x "$(command -v dnf)" ]; then
+        dnf_install_packages "$@"
+    elif [ -x "$(command -v apt-get)" ]; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt_install_packages "$@"
+    else
+        echo "Error: No supported package manager found (apk, dnf, apt)." >&2
+        exit 1
     fi
 }
-
-export DEBIAN_FRONTEND=noninteractive
 
 check_packages curl ca-certificates gpg dirmngr unzip bash-completion less
 
@@ -85,6 +134,31 @@ verify_aws_cli_gpg_signature() {
     return ${status}
 }
 
+get_architecture() {
+    local arch
+    
+    if [ -x "$(command -v dpkg)" ]; then
+        # Safely use dpkg if on Debian/Ubuntu
+        arch=$(dpkg --print-architecture)
+    else
+        # Fallback to universal uname for Alpine/Fedora
+        arch=$(uname -m)
+    fi
+
+    # Normalize names to a standard format if you are downloading external binaries
+    case "${arch}" in
+        aarch64|arm64)
+            echo "arm64"
+            ;;
+        x86_64|amd64)
+            echo "amd64"
+            ;;
+        *)
+            echo "${arch}"
+            ;;
+    esac
+}
+
 install() {
     local scriptZipFile=awscli.zip
     local scriptSigFile=awscli.sig
@@ -93,10 +167,18 @@ install() {
     if [ "${VERSION}" != "latest" ]; then
         local versionStr=-${VERSION}
     fi
-    architecture=$(dpkg --print-architecture)
+
+    if [ -x "$(command -v dpkg)" ]; then
+        # Safely use dpkg if on Debian/Ubuntu
+        architecture=$(dpkg --print-architecture)
+    else
+        # Fallback to universal uname for Alpine/Fedora
+        architecture=$(uname -m)
+    fi
+
     case "${architecture}" in
-        amd64) architectureStr=x86_64 ;;
-        arm64) architectureStr=aarch64 ;;
+        aarch64|arm64) architectureStr=aarch64 ;;
+        x86_64|amd64) architectureStr=x86_64 ;;
         *)
             echo "AWS CLI does not support machine architecture '$architecture'. Please use an x86-64 or ARM64 machine."
             exit 1
@@ -116,7 +198,7 @@ install() {
     else
         unzip "${scriptZipFile}"
     fi
-    
+
     ./aws/install
 
     # AWS bash completion
@@ -134,8 +216,5 @@ install() {
 echo "(*) Installing AWS CLI..."
 
 install
-
-# Clean up
-rm -rf /var/lib/apt/lists/*
 
 echo "Done!"
