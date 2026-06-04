@@ -32,6 +32,8 @@ else
     OS_ID_LIKE="unknown"
 fi
 
+echo "Detected OS: ${OS_ID} with family: ${OS_ID_LIKE}"
+
 # Multi-distro package manager wrapper
 pkg_manager_update() {
     case "${OS_ID}" in
@@ -44,9 +46,9 @@ pkg_manager_update() {
         fedora|rhel|amzn|centos)
             echo "Refreshing package cache..."
             if type dnf > /dev/null 2>&1; then
-                dnf check-update > /dev/null 2>&1 || true
+                dnf update -y > /dev/null 2>&1 || true
             else
-                yum check-update > /dev/null 2>&1 || true
+                yum update -y > /dev/null 2>&1 || true
             fi
             ;;
         alpine)
