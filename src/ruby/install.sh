@@ -17,21 +17,109 @@ INSTALL_RUBY_TOOLS="${INSTALL_RUBY_TOOLS:-"true"}"
 # alongside RUBY_VERSION, but not set as default.
 ADDITIONAL_VERSIONS="${ADDITIONALVERSIONS:-""}"
 
-# Note: ruby-debug-ide will install the right version of debase if missing and
-# installing debase directly fails on Ruby 3.1.0 as of 1/7/2022, so omitting.
-# installing ruby-debug-ide on debian fails, so omitting.
 DEFAULT_GEMS="rake"
-
 RVM_GPG_KEYS="409B6B1796C275462A1703113804BB82D39DC0E3 7D2BAF1CF37B13E2069D6956105BD0E739499BDB"
 
 set -e
 
-# Clean up
-rm -rf /var/lib/apt/lists/*
+# Detect OS Family
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS_ID="${ID}"
+    OS_ID_LIKE="${ID_LIKE}"
+else
+    OS_ID="unknown"
+    OS_ID_LIKE="unknown"
+fi
+
+# Multi-distro package manager wrapper
+pkg_manager_update() {
+    case "${OS_ID}" in
+        debian|ubuntu)
+            if [ "$(find /var/lib/apt/lists/* 2>/dev/null | wc -l)" = "0" ]; then
+                echo "Running apt-get update..."
+                apt-get update -y
+            fi
+            ;;
+        fedora|rhel|amzn|centos)
+            echo "Refreshing package cache..."
+            if type dnf > /dev/null 2>&1; then
+                dnf check-update > /dev/null 2>&1 || true
+            else
+                yum check-update > /dev/null 2>&1 || true
+            fi
+            ;;
+        alpine)
+            echo "Running apk update..."
+            apk update
+            ;;
+    esac
+}
+
+check_packages() {
+    local pkgs_to_install=()
+    case "${OS_ID}" in
+        debian|ubuntu)
+            export DEBIAN_FRONTEND=noninteractive
+            for pkg in "$@"; do
+                if ! dpkg -s "${pkg}" > /dev/null 2>&1; then
+                    pkgs_to_install+=("${pkg}")
+                fi
+            done
+            if [ ${#pkgs_to_install[@]} -gt 0 ]; then
+                pkg_manager_update
+                apt-get -y install --no-install-recommends "${pkgs_to_install[@]}"
+            fi
+            ;;
+        fedora|rhel|amzn|centos)
+            local pkg_cmd="yum"
+            type dnf > /dev/null 2>&1 && pkg_cmd="dnf"
+            for pkg in "$@"; do
+                if ! rpm -q "${pkg}" > /dev/null 2>&1; then
+                    pkgs_to_install+=("${pkg}")
+                fi
+            done
+            if [ ${#pkgs_to_install[@]} -gt 0 ]; then
+                ${pkg_cmd} -y install "${pkgs_to_install[@]}"
+            fi
+            ;;
+        alpine)
+            for pkg in "$@"; do
+                if ! apk info -e "${pkg}" > /dev/null 2>&1; then
+                    pkgs_to_install+=("${pkg}")
+                fi
+            done
+            if [ ${#pkgs_to_install[@]} -gt 0 ]; then
+                pkg_manager_update
+                apk add --no-cache "${pkgs_to_install[@]}"
+            fi
+            ;;
+    esac
+}
+
+# Clean initial package caches safely
+if [ "${OS_ID}" = "debian" ] || [ "${OS_ID}" = "ubuntu" ]; then
+    rm -rf /var/lib/apt/lists/*
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
     echo -e 'Script must be run as root. Use sudo, su, or add "USER root" to your Dockerfile before running this script.'
     exit 1
+fi
+
+# Cross-distro dependencies mappings
+if [ "${OS_ID}" = "alpine" ]; then
+    # Alpine target dependencies
+    check_packages bash curl ca-certificates build-base gnupg procps gawk autoconf automake bison libffi-dev gdbm-dev ncurses-dev sqlite-dev libtool yaml-dev pkgconfig zlib-dev gmp-dev openssl-dev shadow git jq
+elif [ "${OS_ID}" = "fedora" ] || [ "${OS_ID}" = "rhel" ] || [ "${OS_ID}" = "amzn" ]; then
+    # RedHat family target dependencies
+    check_packages curl ca-certificates make gcc gcc-c++ gnupg2 procps gawk autoconf automake bison libffi-devel gdbm-devel ncurses-devel sqlite-devel libtool libyaml-devel pkgconfig zlib-devel gmp-devel openssl-devel git jq
+else
+    # Debian/Ubuntu targets
+    check_packages curl ca-certificates build-essential gnupg2 libreadline-dev procps dirmngr gawk autoconf automake bison libffi-dev libgdbm-dev libncurses5-dev libsqlite3-dev libtool libyaml-dev pkg-config sqlite3 zlib1g-dev libgmp-dev libssl-dev jq git
+    if [ "${VERSION_CODENAME}" != "trixie" ]; then
+        check_packages software-properties-common
+    fi
 fi
 
 # Ensure that login shells get the correct path if the user updated the PATH using ENV.
@@ -58,17 +146,27 @@ fi
 
 updaterc() {
     if [ "${UPDATE_RC}" = "true" ]; then
-        echo "Updating /etc/bash.bashrc and /etc/zsh/zshrc..."
-        if [[ "$(cat /etc/bash.bashrc)" != *"$1"* ]]; then
-            echo -e "$1" >> /etc/bash.bashrc
+        echo "Updating shell configurations..."
+        local rc_files=()
+        [ -f /etc/bash.bashrc ] && rc_files+=( "/etc/bash.bashrc" )
+        [ -f /etc/bashrc ] && rc_files+=( "/etc/bashrc" )
+        [ -f /etc/zsh/zshrc ] && rc_files+=( "/etc/zsh/zshrc" )
+        
+        # Alpine/Minimal fallbacks if global configurations don't exist
+        if [ ${#rc_files[@]} -eq 0 ]; then
+            mkdir -p /etc
+            touch /etc/bashrc
+            rc_files+=( "/etc/bashrc" )
         fi
-        if [ -f "/etc/zsh/zshrc" ] && [[ "$(cat /etc/zsh/zshrc)" != *"$1"* ]]; then
-            echo -e "$1" >> /etc/zsh/zshrc
-        fi
+
+        for rc_file in "${rc_files[@]}"; do
+            if [[ "$(cat "${rc_file}")" != *"$1"* ]]; then
+                echo -e "$1" >> "${rc_file}"
+            fi
+        done
     fi
 }
 
-# Get the list of GPG key servers that are reachable
 get_gpg_key_servers() {
     declare -A keyservers_curl_map=(
         ["hkp://keyserver.ubuntu.com"]="http://keyserver.ubuntu.com:11371"
@@ -76,9 +174,8 @@ get_gpg_key_servers() {
         ["hkps://keys.openpgp.org"]="https://keys.openpgp.org"
         ["hkp://keyserver.pgp.com"]="http://keyserver.pgp.com:11371"
     )
-
     local curl_args=""
-    local keyserver_reachable=false  # Flag to indicate if any keyserver is reachable
+    local keyserver_reachable=false
 
     if [ ! -z "${KEYSERVER_PROXY}" ]; then
         curl_args="--proxy ${KEYSERVER_PROXY}"
@@ -100,7 +197,6 @@ get_gpg_key_servers() {
     fi
 }
 
-# Import the specified key in a variable name passed in as 
 receive_gpg_keys() {
     local keys=${!1}
     local keyring_args=""
@@ -108,17 +204,11 @@ receive_gpg_keys() {
         keyring_args="--no-default-keyring --keyring \"$2\""
     fi
 
-    # Install curl
-    if ! type curl > /dev/null 2>&1; then
-        check_packages curl
-    fi
-
-    # Use a temporary location for gpg keys to avoid polluting image
     export GNUPGHOME="/tmp/tmp-gnupg"
     mkdir -p ${GNUPGHOME}
     chmod 700 ${GNUPGHOME}
     echo -e "disable-ipv6\n$(get_gpg_key_servers)" > ${GNUPGHOME}/dirmngr.conf
-    # GPG key download sometimes fails for some reason and retrying fixes it.
+    
     local retry_count=0
     local gpg_ok="false"
     set +e
@@ -139,7 +229,6 @@ receive_gpg_keys() {
     fi
 }
 
-# Figure out correct version of a three part version number is not passed
 find_version_from_git_tags() {
     local variable_name=$1
     local requested_version=${!variable_name}
@@ -148,7 +237,7 @@ find_version_from_git_tags() {
     local prefix=${3:-"tags/v"}
     local separator=${4:-"."}
     local last_part_optional=${5:-"false"}    
-    if [ "$(echo "${requested_version}" | grep -o "." | wc -l)" != "2" ]; then
+    if [ "$(echo "${requested_version}" | grep -o "\." | wc -l)" != "2" ]; then
         local escaped_separator=${separator//./\\.}
         local last_part
         if [ "${last_part_optional}" = "true" ]; then
@@ -173,20 +262,14 @@ find_version_from_git_tags() {
     echo "${variable_name}=${!variable_name}"
 }
 
-# Use semver logic to decrement a version number then look for the closest match
 find_prev_version_from_git_tags() {
     local variable_name=$1
     local current_version=${!variable_name}
     local repository=$2
-    # Normally a "v" is used before the version number, but support alternate cases
     local prefix=${3:-"tags/v"}
-    # Some repositories use "_" instead of "." for version number part separation, support that
     local separator=${4:-"."}
-    # Some tools release versions that omit the last digit (e.g. go)
     local last_part_optional=${5:-"false"}
-    # Some repositories may have tags that include a suffix (e.g. actions/node-versions)
     local version_suffix_regex=$6
-    # Try one break fix version number less if we get a failure. Use "set +e" since "set -e" can cause failures in valid scenarios.
     set +e
         major="$(echo "${current_version}" | grep -oE '^[0-9]+' || echo '')"
         minor="$(echo "${current_version}" | grep -oP '^[0-9]+\.\K[0-9]+' || echo '')"
@@ -195,13 +278,10 @@ find_prev_version_from_git_tags() {
         if [ "${minor}" = "0" ] && [ "${breakfix}" = "0" ]; then
             ((major=major-1))
             declare -g ${variable_name}="${major}"
-            # Look for latest version from previous major release
             find_version_from_git_tags "${variable_name}" "${repository}" "${prefix}" "${separator}" "${last_part_optional}"
-        # Handle situations like Go's odd version pattern where "0" releases omit the last part
         elif [ "${breakfix}" = "" ] || [ "${breakfix}" = "0" ]; then
             ((minor=minor-1))
             declare -g ${variable_name}="${major}.${minor}"
-            # Look for latest version from previous minor release
             find_version_from_git_tags "${variable_name}" "${repository}" "${prefix}" "${separator}" "${last_part_optional}"
         else
             ((breakfix=breakfix-1))
@@ -214,56 +294,6 @@ find_prev_version_from_git_tags() {
     set -e
 }
 
-apt_get_update()
-{
-    if [ "$(find /var/lib/apt/lists/* | wc -l)" = "0" ]; then
-        echo "Running apt-get update..."
-        apt-get update -y
-    fi
-}
-
-# Checks if packages are installed and installs them if not
-check_packages() {
-    if ! dpkg -s "$@" > /dev/null 2>&1; then
-        apt_get_update
-        apt-get -y install --no-install-recommends "$@"
-    fi
-}
-
-# Ensure apt is in non-interactive to avoid prompts
-export DEBIAN_FRONTEND=noninteractive
-
-architecture="$(uname -m)"
-if [ "${architecture}" != "amd64" ] && [ "${architecture}" != "x86_64" ] && [ "${architecture}" != "arm64" ] && [ "${architecture}" != "aarch64" ]; then
-    echo "(!) Architecture $architecture unsupported"
-    exit 1
-fi
-
-# Install dependencies
-# Removed software-properties-common package from here as it has been removed for debian trixie(13)
-check_packages curl ca-certificates build-essential gnupg2 libreadline-dev \
-    procps dirmngr gawk autoconf automake bison libffi-dev libgdbm-dev libncurses5-dev \
-    libsqlite3-dev libtool libyaml-dev pkg-config sqlite3 zlib1g-dev libgmp-dev libssl-dev
-if ! type git > /dev/null 2>&1; then
-    check_packages git
-fi
-
-# Conditionally install software-properties-common (skip on Debian Trixie)
-if type apt-get >/dev/null 2>&1; then
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        if [ "${ID}" = "debian" ] && [ "${VERSION_CODENAME}" = "trixie" ]; then
-            echo "Skipping software-properties-common on Debian Trixie."
-        else
-            check_packages software-properties-common
-        fi
-    else
-        # Fallback for apt-based systems without /etc/os-release
-        check_packages software-properties-common
-    fi
-fi
-
-# Function to fetch the version released prior to the latest version
 get_previous_version() {
     local url=$1
     local repo_url=$2
@@ -271,10 +301,6 @@ get_previous_version() {
     prev_version=${!variable_name}
     
     output=$(curl -s "$repo_url");
-
-    #install jq
-    check_packages jq
-
     message=$(echo "$output" | jq -r '.message')
 
     if [[ $message == "API rate limit exceeded"* ]]; then
@@ -295,8 +321,6 @@ get_github_api_repo_url() {
     echo "${url/https:\/\/github.com/https:\/\/api.github.com\/repos}/releases/latest"
 }
 
-
-# Figure out correct version of a three part version number is not passed
 RUBY_URL="https://github.com/ruby/ruby"
 ORIGINAL_RUBY_VERSION=$RUBY_VERSION
 find_version_from_git_tags RUBY_VERSION $RUBY_URL "tags/v" "_"
@@ -305,7 +329,7 @@ set_rvm_install_args() {
     RUBY_VERSION=$1
     if [ "${RUBY_VERSION}" = "none" ]; then
         RVM_INSTALL_ARGS=""
-    elif [[ "$(ruby -v)" = *"${RUBY_VERSION}"* ]]; then
+    elif [[ "$(ruby -v 2>/dev/null)" = *"${RUBY_VERSION}"* ]]; then
         echo "(!) Ruby is already installed with version ${RUBY_VERSION}. Skipping..."
         RVM_INSTALL_ARGS=""
     else
@@ -334,10 +358,9 @@ install_previous_version() {
     fi
 }
 
-# Just install Ruby if RVM already installed
-if rvm --version > /dev/null; then
+if rvm --version > /dev/null 2>&1; then
     echo "Ruby Version Manager already exists."
-    if [[ "$(ruby -v)" = *"${RUBY_VERSION}"* ]]; then
+    if [[ "$(ruby -v 2>/dev/null)" = *"${RUBY_VERSION}"* ]]; then
         echo "(!) Ruby is already installed with version ${RUBY_VERSION}. Skipping..."
     elif [ "${RUBY_VERSION}" != "none" ]; then
         echo "Installing specified Ruby version."
@@ -346,49 +369,47 @@ if rvm --version > /dev/null; then
     SKIP_GEM_INSTALL="false"
     SKIP_RBENV_RBUILD="true"
 else
-    # Install RVM
     receive_gpg_keys RVM_GPG_KEYS
-    # Determine appropriate settings for rvm installer
     set_rvm_install_args $RUBY_VERSION
-    # Create rvm group as a system group to reduce the odds of conflict with local user UIDs
     if ! cat /etc/group | grep -e "^rvm:" > /dev/null 2>&1; then
         groupadd -r rvm
     fi
-    # Install rvm
     curl -sSL https://get.rvm.io | bash -s stable --ignore-dotfiles ${RVM_INSTALL_ARGS} --with-default-gems="${DEFAULT_GEMS}" 2>&1 || install_previous_version
     usermod -aG rvm ${USERNAME}
-    source /usr/local/rvm/scripts/rvm
+    
+    # Secure dynamic resolution of RVM script paths
+    [ -f /usr/local/rvm/scripts/rvm ] && source /usr/local/rvm/scripts/rvm
+    [ -f /usr/share/rvm/scripts/rvm ] && source /usr/share/rvm/scripts/rvm
+    
     rvm fix-permissions system
     rm -rf ${GNUPGHOME}
 fi
 
 if [ "${INSTALL_RUBY_TOOLS}" = "true" ]; then   
-    # Non-root user may not have "gem" in path when script is run and no ruby version
-    # is installed by rvm, so handle this by using root's default gem in this case
     ROOT_GEM="$(which gem || echo "")"
-    ${ROOT_GEM} install ${DEFAULT_GEMS}
+    if [ ! -z "${ROOT_GEM}" ]; then
+        ${ROOT_GEM} install ${DEFAULT_GEMS}
+    fi
 fi
 
-# VS Code server usually first in the path, so silence annoying rvm warning (that does not apply) and then source it
-updaterc "if ! grep rvm_silence_path_mismatch_check_flag \$HOME/.rvmrc > /dev/null 2>&1; then echo 'rvm_silence_path_mismatch_check_flag=1' >> \$HOME/.rvmrc; fi\nsource /usr/local/rvm/scripts/rvm > /dev/null 2>&1"
+# Clean up configuration scripts mappings
+RVM_SRC_PATH="/usr/local/rvm/scripts/rvm"
+[ ! -f "${RVM_SRC_PATH}" ] && [ -f "/usr/share/rvm/scripts/rvm" ] && RVM_SRC_PATH="/usr/share/rvm/scripts/rvm"
+updaterc "if ! grep rvm_silence_path_mismatch_check_flag \$HOME/.rvmrc > /dev/null 2>&1; then echo 'rvm_silence_path_mismatch_check_flag=1' >> \$HOME/.rvmrc; fi\nsource ${RVM_SRC_PATH} > /dev/null 2>&1"
 
-# Additional ruby versions to be installed but not be set as default.
 if [ ! -z "${ADDITIONAL_VERSIONS}" ]; then
     OLDIFS=$IFS
     IFS=","
         read -a additional_versions <<< "$ADDITIONAL_VERSIONS"
         for version in "${additional_versions[@]}"; do
-            # Figure out correct version of a three part version number is not passed
             find_version_from_git_tags version $RUBY_URL "tags/v" "_"
-            source /usr/local/rvm/scripts/rvm
+            [ -f "${RVM_SRC_PATH}" ] && source "${RVM_SRC_PATH}"
             rvm install ruby ${version}
         done
     IFS=$OLDIFS
 fi
 
-# Install rbenv/ruby-build for good measure
 if [ "${SKIP_RBENV_RBUILD}" != "true" ]; then
-
     if [[ ! -d "/usr/local/share/rbenv" ]]; then
         git clone --depth=1 \
             -c core.eol=lf \
@@ -408,37 +429,48 @@ if [ "${SKIP_RBENV_RBUILD}" != "true" ]; then
             -c receive.fsck.zeroPaddedFilemode=ignore \
             https://github.com/rbenv/ruby-build.git /usr/local/share/ruby-build
         mkdir -p /root/.rbenv/plugins
-
         ln -s /usr/local/share/ruby-build /root/.rbenv/plugins/ruby-build
     fi
 
     if [ "${USERNAME}" != "root" ]; then
-        mkdir -p /home/${USERNAME}/.rbenv/plugins
+        MAPPED_HOME="/home/${USERNAME}"
+        [ "${USERNAME}" = "root" ] && MAPPED_HOME="/root"
+        # Alpine path variations lookup fallback
+        [ ! -d "${MAPPED_HOME}" ] && [ -d "/root" ] && [ "${USERNAME}" = "root" ] && MAPPED_HOME="/root"
 
-        if [[ ! -d "/home/${USERNAME}/.rbenv/plugins/ruby-build" ]]; then
-            ln -s /usr/local/share/ruby-build /home/${USERNAME}/.rbenv/plugins/ruby-build
+        mkdir -p ${MAPPED_HOME}/.rbenv/plugins
+        if [[ ! -d "${MAPPED_HOME}/.rbenv/plugins/ruby-build" ]]; then
+            ln -s /usr/local/share/ruby-build ${MAPPED_HOME}/.rbenv/plugins/ruby-build
         fi
 
-        # Oryx expects ruby to be installed in this specific path, else it breaks the oryx magic for ruby projects.
-        if [ ! -f /usr/local/rvm/gems/default/bin/ruby ]; then
-            ln -s /usr/local/rvm/rubies/default/bin/ruby /usr/local/rvm/gems/default/bin
+        if [ -d /usr/local/rvm ]; then
+            if [ ! -f /usr/local/rvm/gems/default/bin/ruby ]; then
+                mkdir -p /usr/local/rvm/gems/default/bin
+                ln -s /usr/local/rvm/rubies/default/bin/ruby /usr/local/rvm/gems/default/bin 2>/dev/null || true
+            fi
+            chown -R "${USERNAME}:rvm" "/usr/local/rvm/" 2>/dev/null || true
+            chmod -R g+r+w "/usr/local/rvm/" 2>/dev/null || true
         fi
-
-        chown -R "${USERNAME}:rvm" "/home/${USERNAME}/.rbenv/"
-        chmod -R g+r+w "/home/${USERNAME}/.rbenv"
-        find "/home/${USERNAME}/.rbenv" -type d | xargs -n 1 chmod g+s
+        chown -R "${USERNAME}" "${MAPPED_HOME}/.rbenv/" 2>/dev/null || true
     fi
 fi
 
-chown -R "${USERNAME}:rvm" "/usr/local/rvm/"
-chmod -R g+r+w "/usr/local/rvm/"
-find "/usr/local/rvm/" -type d | xargs -n 1 chmod g+s
+if [ -d /usr/local/rvm/ ]; then
+    chown -R "${USERNAME}:rvm" "/usr/local/rvm/" 2>/dev/null || true
+    chmod -R g+r+w "/usr/local/rvm/" 2>/dev/null || true
+    find "/usr/local/rvm/" -type d | xargs -n 1 chmod g+s 2>/dev/null || true
+    rvm cleanup all || true
+fi
 
-# Clean up
-rvm cleanup all
-${ROOT_GEM} cleanup
+if [ ! -z "${ROOT_GEM}" ] && type "${ROOT_GEM}" > /dev/null 2>&1; then
+    ${ROOT_GEM} cleanup 2>/dev/null || true
+fi
 
-# Clean up
-rm -rf /var/lib/apt/lists/*
+# Multi-distro generic cleanup post installations
+case "${OS_ID}" in
+    debian|ubuntu) rm -rf /var/lib/apt/lists/* ;;
+    fedora|rhel|amzn|centos) type dnf >/dev/null 2>&1 && dnf clean all || yum clean all ;;
+    alpine) rm -rf /var/cache/apk/* ;;
+esac
 
 echo "Done!"
