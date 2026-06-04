@@ -80,7 +80,7 @@ check_packages() {
                 fi
             done
             if [ ${#pkgs_to_install[@]} -gt 0 ]; then
-                ${pkg_cmd} -y install "${pkgs_to_install[@]}"
+                ${pkg_cmd} --allowerasing -y install "${pkgs_to_install[@]}"
             fi
             ;;
         alpine)
@@ -151,7 +151,7 @@ updaterc() {
         [ -f /etc/bash.bashrc ] && rc_files+=( "/etc/bash.bashrc" )
         [ -f /etc/bashrc ] && rc_files+=( "/etc/bashrc" )
         [ -f /etc/zsh/zshrc ] && rc_files+=( "/etc/zsh/zshrc" )
-        
+
         # Alpine/Minimal fallbacks if global configurations don't exist
         if [ ${#rc_files[@]} -eq 0 ]; then
             mkdir -p /etc
@@ -208,11 +208,11 @@ receive_gpg_keys() {
     mkdir -p ${GNUPGHOME}
     chmod 700 ${GNUPGHOME}
     echo -e "disable-ipv6\n$(get_gpg_key_servers)" > ${GNUPGHOME}/dirmngr.conf
-    
+
     local retry_count=0
     local gpg_ok="false"
     set +e
-    until [ "${gpg_ok}" = "true" ] || [ "${retry_count}" -eq "5" ]; 
+    until [ "${gpg_ok}" = "true" ] || [ "${retry_count}" -eq "5" ];
     do
         echo "(*) Downloading GPG key..."
         ( echo "${keys}" | xargs -n 1 gpg -q ${keyring_args} --recv-keys) 2>&1 && gpg_ok="true"
@@ -236,7 +236,7 @@ find_version_from_git_tags() {
     local repository=$2
     local prefix=${3:-"tags/v"}
     local separator=${4:-"."}
-    local last_part_optional=${5:-"false"}    
+    local last_part_optional=${5:-"false"}
     if [ "$(echo "${requested_version}" | grep -o "\." | wc -l)" != "2" ]; then
         local escaped_separator=${separator//./\\.}
         local last_part
@@ -287,7 +287,7 @@ find_prev_version_from_git_tags() {
             ((breakfix=breakfix-1))
             if [ "${breakfix}" = "0" ] && [ "${last_part_optional}" = "true" ]; then
                 declare -g ${variable_name}="${major}.${minor}"
-            else 
+            else
                 declare -g ${variable_name}="${major}.${minor}.${breakfix}"
             fi
         fi
@@ -299,7 +299,7 @@ get_previous_version() {
     local repo_url=$2
     variable_name=$3
     prev_version=${!variable_name}
-    
+
     output=$(curl -s "$repo_url");
     message=$(echo "$output" | jq -r '.message')
 
@@ -308,11 +308,11 @@ get_previous_version() {
         echo -e "\nAttempting to find latest version using GitHub tags."
         find_prev_version_from_git_tags prev_version "$url" "tags/v" "_"
         declare -g ${variable_name}="${prev_version}"
-    else 
+    else
         echo -e "\nAttempting to find latest version using GitHub Api."
         version=$(echo "$output" | jq -r '.tag_name' | tr '_' '.')
         declare -g ${variable_name}="${version#v}"
-    fi  
+    fi
     echo "${variable_name}=${!variable_name}"
 }
 
@@ -341,7 +341,7 @@ set_rvm_install_args() {
         fi
         if [ "${INSTALL_RUBY_TOOLS}" = "true" ]; then
             SKIP_GEM_INSTALL="true"
-        else 
+        else
             DEFAULT_GEMS=""
         fi
     fi
@@ -353,7 +353,7 @@ install_previous_version() {
         get_previous_version "${RUBY_URL}" "${repo_url}" RUBY_VERSION
         set_rvm_install_args $RUBY_VERSION
         curl -sSL https://get.rvm.io | bash -s stable --ignore-dotfiles ${RVM_INSTALL_ARGS} --with-default-gems="${DEFAULT_GEMS}" 2>&1
-    else 
+    else
         echo "Failed to install Ruby version $ORIGINAL_RUBY_VERSION. Exiting..."
     fi
 }
@@ -376,16 +376,16 @@ else
     fi
     curl -sSL https://get.rvm.io | bash -s stable --ignore-dotfiles ${RVM_INSTALL_ARGS} --with-default-gems="${DEFAULT_GEMS}" 2>&1 || install_previous_version
     usermod -aG rvm ${USERNAME}
-    
+
     # Secure dynamic resolution of RVM script paths
     [ -f /usr/local/rvm/scripts/rvm ] && source /usr/local/rvm/scripts/rvm
     [ -f /usr/share/rvm/scripts/rvm ] && source /usr/share/rvm/scripts/rvm
-    
+
     rvm fix-permissions system
     rm -rf ${GNUPGHOME}
 fi
 
-if [ "${INSTALL_RUBY_TOOLS}" = "true" ]; then   
+if [ "${INSTALL_RUBY_TOOLS}" = "true" ]; then
     ROOT_GEM="$(which gem || echo "")"
     if [ ! -z "${ROOT_GEM}" ]; then
         ${ROOT_GEM} install ${DEFAULT_GEMS}
