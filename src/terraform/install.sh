@@ -592,22 +592,33 @@ if [ "${TFLINT_VERSION}" != "none" ]; then
                 set -e
 
                 # Check that checksums.txt.keyless.sig exists and is not empty
+                local cosign_ok=false
                 if [ -s checksums.txt.keyless.sig ]; then
-                    # Validate checksums with cosign
+                    # Validate checksums with cosign; rekor.sigstore.dev may be unreachable in
+                    # network-restricted environments, so treat failure as a soft fallback.
                     curl -sSL -o checksums.txt.pem https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt.pem
                     ensure_cosign
+                    set +e
                     cosign verify-blob \
                         --certificate=/tmp/tf-downloads/checksums.txt.pem \
                         --signature=/tmp/tf-downloads/checksums.txt.keyless.sig \
                         --certificate-identity-regexp="^https://github.com/terraform-linters/tflint"  \
                         --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
                         /tmp/tf-downloads/tflint_checksums.txt
-                    # Ensure that checksums.txt has $TFLINT_FILENAME
-                    grep ${TFLINT_FILENAME} /tmp/tf-downloads/tflint_checksums.txt
-                    # Validate downloaded file
-                    sha256sum --ignore-missing -c tflint_checksums.txt
-                else
-                    # Fallback to older, GPG-based verification (pre-0.47.0 of tflint)
+                    cosign_verify_result=$?
+                    set -e
+                    if [ $cosign_verify_result -eq 0 ]; then
+                        cosign_ok=true
+                        # Ensure that checksums.txt has $TFLINT_FILENAME
+                        grep ${TFLINT_FILENAME} /tmp/tf-downloads/tflint_checksums.txt
+                        # Validate downloaded file
+                        sha256sum --ignore-missing -c tflint_checksums.txt
+                    else
+                        echo "(*) Cosign verification failed (Rekor transparency log may be unreachable), falling back to GPG verification..."
+                    fi
+                fi
+                if [ "$cosign_ok" = "false" ]; then
+                    # Fallback to older, GPG-based verification (pre-0.47.0 of tflint, or when cosign/Rekor is unavailable)
                     curl -sSL -o tflint_checksums.txt.sig https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt.sig
                     curl -sSL -o tflint_key "${TFLINT_GPG_KEY_URI}"
                     gpg -q --import tflint_key
