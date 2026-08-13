@@ -9,18 +9,16 @@
 
 set -e
 
-# Clean up
-rm -rf /var/lib/apt/lists/*
-
 TERRAFORM_VERSION="${VERSION:-"latest"}"
 TFLINT_VERSION="${TFLINT:-"latest"}"
 TERRAGRUNT_VERSION="${TERRAGRUNT:-"latest"}"
 INSTALL_SENTINEL=${INSTALLSENTINEL:-false}
 INSTALL_TFSEC=${INSTALLTFSEC:-false}
 INSTALL_TERRAFORM_DOCS=${INSTALLTERRAFORMDOCS:-false}
+TERRAFORM_DOCS_VERSION="${TERRAFORMDOCSVERSION:-"latest"}"
 CUSTOM_DOWNLOAD_SERVER="${CUSTOMDOWNLOADSERVER:-""}"
-# This is because ubuntu noble and debian trixie don't support the old format of GPG keys and validation 
-NEW_GPG_CODENAMES="trixie noble"
+# This is because ubuntu noble, ubuntu resolute and debian trixie don't support the old format of GPG keys and validation
+NEW_GPG_CODENAMES="trixie noble resolute"
 
 TERRAFORM_SHA256="${TERRAFORM_SHA256:-"automatic"}"
 TFLINT_SHA256="${TFLINT_SHA256:-"automatic"}"
@@ -47,17 +45,100 @@ case ${architecture} in
     *) echo "(!) Architecture ${architecture} unsupported"; exit 1 ;;
 esac
 
+# Ensure script is run as root
 if [ "$(id -u)" -ne 0 ]; then
-    echo -e 'Script must be run as root. Use sudo, su, or add "USER root" to your Dockerfile before running this script.'
+    echo 'Script must be run as root. Use sudo, su, or add "USER root" to your Dockerfile.' >&2
     exit 1
 fi
 
-# Detect Ubuntu Noble or Debian Trixie and use new repo setup, else use legacy GPG logic
+# Detect Ubuntu Noble, Ubuntu Resolute or Debian Trixie and use new repo setup, else use legacy GPG logic
 IS_GPG_NEW=0
 . /etc/os-release
-if [[ "${NEW_GPG_CODENAMES}" == *"${VERSION_CODENAME}"* ]]; then
+# Guard against empty VERSION_CODENAME (Alpine, Fedora) which would cause *""* to match everything
+if [ -n "${VERSION_CODENAME}" ] && [[ "${NEW_GPG_CODENAMES}" == *"${VERSION_CODENAME}"* ]]; then
     IS_GPG_NEW=1
 fi
+
+# --- ALPINE (apk) ---
+apk_install_packages() {
+    # Translate Debian-centric package names to their Alpine equivalents
+    local pkgs=()
+    for pkg in "$@"; do
+        case "$pkg" in
+            gnupg2)   pkgs+=(gnupg) ;;
+            dnsutils) pkgs+=(bind-tools) ;;
+            dirmngr)  ;; # included in gnupg on Alpine
+            *)        pkgs+=("$pkg") ;;
+        esac
+    done
+    [ ${#pkgs[@]} -gt 0 ] && apk add --no-cache "${pkgs[@]}"
+}
+
+# --- REDHAT/FEDORA (dnf) ---
+dnf_install_packages() {
+    # Translate Debian-centric package names to their Fedora equivalents
+    local pkgs=()
+    for pkg in "$@"; do
+        case "$pkg" in
+            dnsutils) pkgs+=(bind-utils) ;;
+            dirmngr)  ;; # included in gnupg2 on Fedora
+            *)        pkgs+=("$pkg") ;;
+        esac
+    done
+
+    if [ ${#pkgs[@]} -eq 0 ]; then return; fi
+
+    if ! dnf list installed "${pkgs[@]}" > /dev/null 2>&1; then
+        if [ "$(find /var/cache/dnf/ -type f | wc -l)" = "0" ]; then
+            echo "Running dnf update..."
+            dnf update -y
+        fi
+        echo "Installing packages via dnf: ${pkgs[*]}"
+        dnf -y install --allowerasing "${pkgs[@]}"
+
+        echo "Cleaning up dnf cache..."
+        dnf clean all
+        rm -rf /var/cache/dnf
+    fi
+}
+
+# --- DEBIAN/UBUNTU (apt) ---
+apt_install_packages() {
+    local missing_pkgs=""
+    for pkg in "$@"; do
+        if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+            missing_pkgs="$missing_pkgs $pkg"
+        fi
+    done
+
+    if [ -n "$missing_pkgs" ]; then
+        if [ "$(find /var/lib/apt/lists/ -type f | wc -l)" = "0" ]; then
+            echo "Running apt-get update..."
+            apt-get update -y
+        fi
+        echo "Installing packages via apt: $missing_pkgs"
+        apt-get -y install --no-install-recommends $missing_pkgs
+
+        echo "Cleaning up apt cache..."
+        apt-get clean
+        rm -rf /var/lib/apt/lists/*
+    fi
+}
+
+# --- MAIN ENTRYPOINT ---
+check_packages() {
+    if [ -x "$(command -v apk)" ]; then
+        apk_install_packages "$@"
+    elif [ -x "$(command -v dnf)" ]; then
+        dnf_install_packages "$@"
+    elif [ -x "$(command -v apt-get)" ]; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt_install_packages "$@"
+    else
+        echo "Error: No supported package manager found (apk, dnf, apt)." >&2
+        exit 1
+    fi
+}
 
 # Get the list of GPG key servers that are reachable
 get_gpg_key_servers() {
@@ -68,7 +149,7 @@ get_gpg_key_servers() {
     )
 
     local curl_args=""
-    local keyserver_reachable=false  # Flag to indicate if any keyserver is reachable
+    local keyserver_reachable=false
 
     if [ ! -z "${KEYSERVER_PROXY}" ]; then
         curl_args="--proxy ${KEYSERVER_PROXY}"
@@ -90,7 +171,7 @@ get_gpg_key_servers() {
     fi
 }
 
-# Import the specified key in a variable name passed in as 
+# Import the specified key in a variable name passed in as
 receive_gpg_keys() {
     local keys=${!1}
     local keyring_args=""
@@ -110,7 +191,7 @@ receive_gpg_keys() {
     export GNUPGHOME="/tmp/tmp-gnupg"
     mkdir -p ${GNUPGHOME}
     chmod 700 ${GNUPGHOME}
-    
+
     # Special handling for HashiCorp GPG key on Ubuntu Noble
     if [ "$IS_GPG_NEW" -eq 1 ] && [ "$keys" = "$TERRAFORM_GPG_KEY" ]; then
         echo "(*) Ubuntu Noble detected, using Keybase for HashiCorp GPG key import...."
@@ -130,7 +211,7 @@ receive_gpg_keys() {
     local retry_count=0
     local gpg_ok="false"
     set +e
-    until [ "${gpg_ok}" = "true" ] || [ "${retry_count}" -eq "5" ]; 
+    until [ "${gpg_ok}" = "true" ] || [ "${retry_count}" -eq "5" ];
     do
         echo "(*) Downloading GPG key..."
         ( echo "${keys}" | xargs -n 1 gpg -q ${keyring_args} --recv-keys) 2>&1 && gpg_ok="true"
@@ -147,8 +228,8 @@ receive_gpg_keys() {
         echo "(*) Resolving GPG keyserver IP address..."
         local keyserver_ip_address=$( dig +short keyserver.ubuntu.com | head -n1 )
         echo "(*) GPG keyserver IP address $keyserver_ip_address"
-        
-        until [ "${gpg_ok}" = "true" ] || [ "${retry_count}" -eq "3" ]; 
+
+        until [ "${gpg_ok}" = "true" ] || [ "${retry_count}" -eq "3" ];
         do
             echo "(*) Downloading GPG key..."
             ( echo "${keys}" | xargs -n 1 gpg -q ${keyring_args} --recv-keys --keyserver ${keyserver_ip_address}) 2>&1 && gpg_ok="true"
@@ -174,7 +255,7 @@ find_version_from_git_tags() {
     local repository=$2
     local prefix=${3:-"tags/v"}
     local separator=${4:-"."}
-    local last_part_optional=${5:-"false"}    
+    local last_part_optional=${5:-"false"}
     if [ "$(echo "${requested_version}" | grep -o "." | wc -l)" != "2" ]; then
         local escaped_separator=${separator//./\\.}
         local last_part
@@ -234,7 +315,7 @@ find_prev_version_from_git_tags() {
             ((breakfix=breakfix-1))
             if [ "${breakfix}" = "0" ] && [ "${last_part_optional}" = "true" ]; then
                 declare -g ${variable_name}="${major}.${minor}"
-            else 
+            else
                 declare -g ${variable_name}="${major}.${minor}.${breakfix}"
             fi
         fi
@@ -249,7 +330,8 @@ find_sentinel_version_from_url() {
     if [ "$(echo "${requested_version}" | grep -o "." | wc -l)" != "2" ]; then
         local prefix='sentinel_'
         local regex="${prefix}\d.\d{2}.\d(?:-\w*)?"
-        local version_list="$(wget -q $2 -O - | grep -oP ${regex} | sed "s/^${prefix}//" | sort -rV)"
+        # Use curl instead of wget for consistency across Alpine, Fedora, and Debian
+        local version_list="$(curl -fsSL $2 | grep -oP ${regex} | sed "s/^${prefix}//" | sort -rV)"
         if [ "${requested_version}" = "latest" ] || [ "${requested_version}" = "current" ] || [ "${requested_version}" = "lts" ]; then
             declare -g ${variable_name}="$(echo "${version_list}" | head -n 1)"
         else
@@ -265,36 +347,20 @@ find_sentinel_version_from_url() {
     echo "${variable_name}=${!variable_name}"
 }
 
-apt_get_update()
-{
-    if [ "$(find /var/lib/apt/lists/* | wc -l)" = "0" ]; then
-        echo "Running apt-get update..."
-        apt-get update -y
-    fi
-}
-
-# Checks if packages are installed and installs them if not
-check_packages() {
-    if ! dpkg -s "$@" > /dev/null 2>&1; then
-        apt_get_update
-        apt-get -y install --no-install-recommends "$@"
-    fi
-}
-
 # Function to fetch the version released prior to the latest version
 get_previous_version() {
     local url=$1
     local repo_url=$2
     local variable_name=$3
     prev_version=${!variable_name}
-    
+
     output=$(curl -s "$repo_url");
 
     # install jq
     check_packages jq
-    
+
     message=$(echo "$output" | jq -r '.message')
-    
+
     if [[ $message == "API rate limit exceeded"* ]]; then
         echo -e "\nAn attempt to find latest version using GitHub Api Failed... \nReason: ${message}"
         echo -e "\nAttempting to find latest version using GitHub tags."
@@ -304,7 +370,7 @@ get_previous_version() {
         echo -e "\nAttempting to find latest version using GitHub Api."
         version=$(echo "$output" | jq -r '.tag_name')
         declare -g ${variable_name}="${version#v}"
-    fi  
+    fi
     echo "${variable_name}=${!variable_name}"
 }
 
@@ -331,20 +397,40 @@ install_previous_version() {
 install_cosign() {
     COSIGN_VERSION=$1
     local URL=$2
-    cosign_filename="/tmp/cosign_${COSIGN_VERSION}_${architecture}.deb"
-    cosign_url="https://github.com/sigstore/cosign/releases/latest/download/cosign_${COSIGN_VERSION}_${architecture}.deb"
-    curl -L "${cosign_url}" -o $cosign_filename
-    if grep -q "Not Found" "$cosign_filename"; then
-        echo -e "\n(!) Failed to fetch the latest artifacts for cosign v${COSIGN_VERSION}..."
-        REPO_URL=$(get_github_api_repo_url "$URL")
-        get_previous_version "$URL" "$REPO_URL" COSIGN_VERSION
-        echo -e "\nAttempting to install ${COSIGN_VERSION}"
+
+    if [ -x "$(command -v apt-get)" ]; then
+        # Debian/Ubuntu: install via .deb package
         cosign_filename="/tmp/cosign_${COSIGN_VERSION}_${architecture}.deb"
         cosign_url="https://github.com/sigstore/cosign/releases/latest/download/cosign_${COSIGN_VERSION}_${architecture}.deb"
         curl -L "${cosign_url}" -o $cosign_filename
+        if grep -q "Not Found" "$cosign_filename"; then
+            echo -e "\n(!) Failed to fetch the latest artifacts for cosign v${COSIGN_VERSION}..."
+            REPO_URL=$(get_github_api_repo_url "$URL")
+            get_previous_version "$URL" "$REPO_URL" COSIGN_VERSION
+            echo -e "\nAttempting to install ${COSIGN_VERSION}"
+            cosign_filename="/tmp/cosign_${COSIGN_VERSION}_${architecture}.deb"
+            cosign_url="https://github.com/sigstore/cosign/releases/latest/download/cosign_${COSIGN_VERSION}_${architecture}.deb"
+            curl -L "${cosign_url}" -o $cosign_filename
+        fi
+        dpkg -i $cosign_filename
+        rm $cosign_filename
+    else
+        # Alpine/Fedora: install via standalone binary
+        cosign_filename="/tmp/cosign-linux-${architecture}"
+        cosign_url="https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-${architecture}"
+        curl -L "${cosign_url}" -o $cosign_filename
+        if grep -q "Not Found" "$cosign_filename"; then
+            echo -e "\n(!) Failed to fetch the latest artifacts for cosign v${COSIGN_VERSION}..."
+            REPO_URL=$(get_github_api_repo_url "$URL")
+            get_previous_version "$URL" "$REPO_URL" COSIGN_VERSION
+            echo -e "\nAttempting to install ${COSIGN_VERSION}"
+            cosign_filename="/tmp/cosign-linux-${architecture}"
+            cosign_url="https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-${architecture}"
+            curl -L "${cosign_url}" -o $cosign_filename
+        fi
+        chmod +x $cosign_filename
+        mv $cosign_filename /usr/local/bin/cosign
     fi
-    dpkg -i $cosign_filename
-    rm $cosign_filename
     echo "Installation of cosign succeeded with ${COSIGN_VERSION}."
 }
 
@@ -366,9 +452,6 @@ ensure_cosign() {
     fi
     cosign version
 }
-
-# Ensure apt is in non-interactive to avoid prompts
-export DEBIAN_FRONTEND=noninteractive
 
 # Install dependencies if missing
 check_packages curl ca-certificates gnupg2 dirmngr coreutils unzip dnsutils
@@ -460,11 +543,28 @@ install_tflint() {
     curl -sSL -o /tmp/tf-downloads/${TFLINT_FILENAME} https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/${TFLINT_FILENAME}
 }
 
+verify_tflint_attestations() {
+    local checksums=$1
+    local checksums_sha256=$(sha256sum "$checksums" | cut -d " " -f 1)
+
+    check_packages jq
+
+    curl -L -f "https://api.github.com/repos/terraform-linters/tflint/attestations/sha256:${checksums_sha256}" > attestation.json
+    curl_exit_code=$?
+    if [ $curl_exit_code -ne 0 ]; then
+        echo "(*) Failed to fetch GitHub Attestations for tflint checksums"
+        return 1
+    fi
+
+    jq ".attestations[].bundle" attestation.json > bundle.jsonl
+    gh at verify "$checksums" -R terraform-linters/tflint -b bundle.jsonl
+}
+
 if [ "${TFLINT_VERSION}" != "none" ]; then
     echo "Downloading tflint..."
     TFLINT_FILENAME="tflint_linux_${architecture}.zip"
     install_tflint "$TFLINT_VERSION"
-    if grep -q "Not Found" "/tmp/tf-downloads/${TFLINT_FILENAME}"; then 
+    if grep -q "Not Found" "/tmp/tf-downloads/${TFLINT_FILENAME}"; then
         install_previous_version TFLINT_VERSION "$tflint_url" "install_tflint"
     fi
     if [ "${TFLINT_SHA256}" != "dev-mode" ]; then
@@ -475,31 +575,44 @@ if [ "${TFLINT_VERSION}" != "none" ]; then
         else
             curl -sSL -o tflint_checksums.txt https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt
 
+            # Attempt GitHub Attestation verification (0.51.1+)
             set +e
-            curl -sSL -o checksums.txt.keyless.sig https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt.keyless.sig
+            verify_tflint_attestations tflint_checksums.txt
+            verify_result=$?
             set -e
 
-            # Check that checksums.txt.keyless.sig exists and is not empty
-            if [ -s checksums.txt.keyless.sig ]; then
-                # Validate checksums with cosign
-                curl -sSL -o checksums.txt.pem https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt.pem
-                ensure_cosign
-                cosign verify-blob \
-                    --certificate=/tmp/tf-downloads/checksums.txt.pem \
-                    --signature=/tmp/tf-downloads/checksums.txt.keyless.sig \
-                    --certificate-identity-regexp="^https://github.com/terraform-linters/tflint"  \
-                    --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
-                    /tmp/tf-downloads/tflint_checksums.txt
-                # Ensure that checksums.txt has $TFLINT_FILENAME
-                grep ${TFLINT_FILENAME} /tmp/tf-downloads/tflint_checksums.txt
-                # Validate downloaded file
+            if [ $verify_result -eq 0 ]; then
                 sha256sum --ignore-missing -c tflint_checksums.txt
+                echo "(*) tflint_checksums.txt verified successfully using GitHub Attestation."
             else
-                # Fallback to older, GPG-based verification (pre-0.47.0 of tflint)
-                curl -sSL -o tflint_checksums.txt.sig https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt.sig
-                curl -sSL -o tflint_key "${TFLINT_GPG_KEY_URI}"
-                gpg -q --import tflint_key
-                gpg --verify tflint_checksums.txt.sig tflint_checksums.txt
+                # Fallback to cosign verification
+                echo "(*) GitHub Attestation verification failed or not supported for this version, falling back to Cosign verification..."
+                set +e
+                curl -sSL -o checksums.txt.keyless.sig https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt.keyless.sig
+                set -e
+
+                # Check that checksums.txt.keyless.sig exists and is not empty
+                if [ -s checksums.txt.keyless.sig ]; then
+                    # Validate checksums with cosign
+                    curl -sSL -o checksums.txt.pem https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt.pem
+                    ensure_cosign
+                    cosign verify-blob \
+                        --certificate=/tmp/tf-downloads/checksums.txt.pem \
+                        --signature=/tmp/tf-downloads/checksums.txt.keyless.sig \
+                        --certificate-identity-regexp="^https://github.com/terraform-linters/tflint"  \
+                        --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+                        /tmp/tf-downloads/tflint_checksums.txt
+                    # Ensure that checksums.txt has $TFLINT_FILENAME
+                    grep ${TFLINT_FILENAME} /tmp/tf-downloads/tflint_checksums.txt
+                    # Validate downloaded file
+                    sha256sum --ignore-missing -c tflint_checksums.txt
+                else
+                    # Fallback to older, GPG-based verification (pre-0.47.0 of tflint)
+                    curl -sSL -o tflint_checksums.txt.sig https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/checksums.txt.sig
+                    curl -sSL -o tflint_key "${TFLINT_GPG_KEY_URI}"
+                    gpg -q --import tflint_key
+                    gpg --verify tflint_checksums.txt.sig tflint_checksums.txt
+                fi
             fi
         fi
     fi
@@ -562,7 +675,7 @@ if [ "${INSTALL_SENTINEL}" = "true" ]; then
                 verify_signature TERRAFORM_GPG_KEY "$sha256sums_url" "$sig_url" "sentinel_checksums.txt" "sentinel_checksums.txt.sig"
             fi
             # Verify the SHASUM matches the archive
-            shasum -a 256 --ignore-missing -c sentinel_checksums.txt            
+            shasum -a 256 --ignore-missing -c sentinel_checksums.txt
         else
             echo "${SENTINEL_SHA256} *${SENTINEL_FILENAME}" >sentinel_checksums.txt
         fi
@@ -586,7 +699,7 @@ if [ "${INSTALL_TFSEC}" = "true" ]; then
     tfsec_filename="tfsec_${TFSEC_VERSION}_linux_${architecture}.tar.gz"
     echo "(*) Downloading TFSec... ${tfsec_filename}"
     install_tfsec "$TFSEC_VERSION"
-    if grep -q "Not Found" "/tmp/tf-downloads/${tfsec_filename}"; then 
+    if grep -q "Not Found" "/tmp/tf-downloads/${tfsec_filename}"; then
         install_previous_version TFSEC_VERSION $tfsec_url "install_tfsec"
         tfsec_filename="tfsec_${TFSEC_VERSION}_linux_${architecture}.tar.gz"
     fi
@@ -611,7 +724,6 @@ install_terraform_docs() {
 }
 
 if [ "${INSTALL_TERRAFORM_DOCS}" = "true" ]; then
-    TERRAFORM_DOCS_VERSION="latest"
     terraform_docs_url='https://github.com/terraform-docs/terraform-docs'
     find_version_from_git_tags TERRAFORM_DOCS_VERSION $terraform_docs_url
     tfdocs_filename="terraform-docs-v${TERRAFORM_DOCS_VERSION}-linux-${architecture}.tar.gz"
@@ -636,8 +748,5 @@ if [ "${INSTALL_TERRAFORM_DOCS}" = "true" ]; then
 fi
 
 rm -rf /tmp/tf-downloads ${GNUPGHOME}
-
-# Clean up
-rm -rf /var/lib/apt/lists/*
 
 echo "Done!"
