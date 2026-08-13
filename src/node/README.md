@@ -1,5 +1,5 @@
 
-# Node.js (via nvm), yarn and pnpm (node)
+# Node.js (via nvm), yarn and pnpm. (node)
 
 Installs Node.js, nvm, yarn, pnpm, and needed dependencies.
 
@@ -7,16 +7,7 @@ Installs Node.js, nvm, yarn, pnpm, and needed dependencies.
 
 ```json
 "features": {
-    "ghcr.io/devcontainers/features/node:2": {}
-}
-```
-
-```json
-"features": {
-    "ghcr.io/devcontainers/features/node:2": {
-        "version": "20",
-        "npmVersion": "10.8.0"
-    }
+    "ghcr.io/HFR1994/features/node:2": {}
 }
 ```
 
@@ -69,4 +60,4 @@ Debian/Ubuntu, RedHat Enterprise Linux, Fedora, Alma, and Rocky Linux distributi
 
 ---
 
-_Note: This file was auto-generated from the [devcontainer-feature.json](https://github.com/devcontainers/features/blob/main/src/node/devcontainer-feature.json).  Add additional notes to a `NOTES.md`._
+_Note: This file was auto-generated from the [devcontainer-feature.json](https://github.com/HFR1994/features/blob/main/src/node/devcontainer-feature.json).  Add additional notes to a `NOTES.md`._
